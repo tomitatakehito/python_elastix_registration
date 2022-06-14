@@ -13,6 +13,7 @@
 #
 #
 #v2 preprocesses images (translates the images such that center of mass matches the image center, and also normalises the intensity)
+#v3 preprocesses images (translates the images using XY max and YZ max projection data for registration)
 
 import os, os.path, re, sys
 from subprocess import Popen, PIPE
@@ -27,14 +28,9 @@ import linecache
 from scipy import ndimage
 import cv2
 from tqdm import tqdm
-import requests
-
-url = "https://raw.githubusercontent.com/tomitatakehito/python_elastix_registration/main/elastix_parameter_file_templates/elastix-parameters_Euler.txt"
-
-resp = requests.get(url)
-print(resp.status_code)
-
-sys.exit()
+import matplotlib.pyplot as plt
+from tifffile import imwrite
+from pystackreg import StackReg
 
 def ensure_empty_dir(path):
 		if os.path.isdir(path):
@@ -213,8 +209,6 @@ elastix_parameter_file_for_translation = 'E:/SWAP/Takehito/elastix_parameter_fil
 elastix_parameter_file_for_Euler_bg_zero = 'E:/SWAP/Takehito/elastix_parameter_file_templates/elastix-parameters_Euler_bg_zero.txt'
 elastix_parameter_file_for_translation_bg_zero = 'E:/SWAP/Takehito/elastix_parameter_file_templates/elastix-parameters_Translation_bg_zero.txt'
 
-#download files from github repo
-
 
 wdir = os.getcwd()
 p = Path(wdir)
@@ -226,7 +220,7 @@ y_res = 1068.18/512
 z_res = 10
 threshold = 230
 ref_channel = 'ch1'
-other_channels = ['ch0']
+all_channels = ['ch0','ch1']
 ##########################
 
 # output_folder = os.path.join(wdir,'transition_test')
@@ -236,7 +230,9 @@ other_channels = ['ch0']
 
 # ensure_empty_dir(output_folder)
 
-for sample in ['E4']:
+group = 'G1'
+
+for sample in ['E1']:
 	output_folder = os.path.join(wdir,'python_reg_'+sample)
 
 	if not os.path.isdir(output_folder):
@@ -249,45 +245,101 @@ for sample in ['E4']:
 	if not os.path.isdir(temporary_mhd_folder):
 		os.mkdir(temporary_mhd_folder)
 
-	# translated_folder =  os.path.join(output_folder,'translated_'+sample)
-	# if not os.path.isdir(translated_folder):
-	#     os.mkdir(translated_folder)
+	translated_max_folder =  os.path.join(temporary_mhd_folder,'translated_max_'+sample)
+	if not os.path.isdir(translated_max_folder):
+	    os.mkdir(translated_max_folder)
 
-	first_stack_tif_names = list( p.glob('2022*_01_Average_'+sample+'_'+ref_channel+'*.tif') )
+	ensure_empty_dir(translated_max_folder)
+
+	first_stack_tif_names = list( p.glob('2022*_01_'+group+'_Average_'+sample+'_'+ref_channel+'*.tif') )
 	first_stack_tif_names.sort()
-	second_stack_tif_names = list( p.glob('2022*_02_Average_'+sample+'_'+ref_channel+'*.tif') )
+	second_stack_tif_names = list( p.glob('2022*_02_'+group+'_Average_'+sample+'_'+ref_channel+'*.tif') )
 	second_stack_tif_names.sort()
 
-	base_name = first_stack_tif_names[0].name.replace('E7_01_Average','E7_01_to_02_Average').replace('_t000.tif','_t')
+	base_name = re.sub('t\d{3}.tif','',first_stack_tif_names[0].name).replace('E7_01_'+group+'_Average','E7_01_to_02_'+group+'_Average')
+
+	reference_frame = len(first_stack_tif_names)
+
+	ref_image_data = io.imread(first_stack_tif_names[0],plugin = 'tifffile')
+	ref_image_data_COM = ndimage.measurements.center_of_mass(ref_image_data>threshold)
+	difference_vector = np.array(ref_image_data.shape)/2 - np.array(ref_image_data_COM)
+
+	difference_vector_dic = {0:difference_vector}
 
 	#preprocess images
-	for stack_tif_name in tqdm(first_stack_tif_names + second_stack_tif_names):
-		#translate the reference channel, save as mhd
+	# for frame in np.arange(1,len(first_stack_tif_names + second_stack_tif_names),1):
+	for frame in tqdm(np.arange(1,len(first_stack_tif_names + second_stack_tif_names),1)):
+
+		fixed_stack_tif_name = (first_stack_tif_names + second_stack_tif_names)[frame]
+		moving_stack_tif_name = (first_stack_tif_names + second_stack_tif_names)[frame-1]
+
+		#find the translation movements by registering XY max and YZ max
+		fixed_stack_tif_data = io.imread(fixed_stack_tif_name,plugin = 'tifffile')
+		moving_stack_tif_data = io.imread(moving_stack_tif_name,plugin = 'tifffile')
+
+		XY_max_fixed_stack_tif_data = np.max(fixed_stack_tif_data,axis=0)
+		YZ_max_fixed_stack_tif_data = np.max(fixed_stack_tif_data,axis=2)
+		XY_max_moving_stack_tif_data = np.max(moving_stack_tif_data,axis=0)
+		YZ_max_moving_stack_tif_data = np.max(moving_stack_tif_data,axis=2)
+
+		sr = StackReg(StackReg.TRANSLATION)
+		out_tra = sr.register(XY_max_fixed_stack_tif_data,XY_max_moving_stack_tif_data)
+		X_diff = out_tra[0,2]
+		Y_diff = out_tra[1,2]
+
+		YZ_max_fixed_mask = gaussian_filter(YZ_max_fixed_stack_tif_data.astype(np.float32),sigma = 5)>(threshold+30)
+		Z_fixed_edge = np.where(np.max(YZ_max_fixed_mask,axis=1))[0][-1]
+		YZ_max_moving_mask = gaussian_filter(YZ_max_moving_stack_tif_data.astype(np.float32),sigma = 5)>(threshold+30)
+		Z_moving_edge = np.where(np.max(YZ_max_moving_mask,axis=1))[0][-1]
+		Z_diff =  Z_moving_edge - Z_fixed_edge
+
+		difference_vector_dic[frame] = np.array([Z_diff,Y_diff,X_diff])
+
+	ref_image_data = io.imread(second_stack_tif_names[0],plugin = 'tifffile')
+	ref_image_data_COM = ndimage.measurements.center_of_mass(ref_image_data>threshold)
+	default_vector = np.array(ref_image_data.shape)/2 - np.array(ref_image_data_COM)
+
+	for i in np.arange(len(first_stack_tif_names)+1):
+		default_vector -= difference_vector_dic[i]
+	#translate each frame
+	for frame,stack_tif_name in tqdm(enumerate(first_stack_tif_names + second_stack_tif_names)):
+ 
 		ref_image_data = io.imread(stack_tif_name,plugin = 'tifffile')
-		
-		ref_image_data_COM = ndimage.measurements.center_of_mass(ref_image_data>threshold)
-		difference_vector = np.array(ref_image_data.shape)/2 - np.array(ref_image_data_COM)
-		translated_ref_image_data = translate_3D(ref_image_data,difference_vector)
+
+		translation_vector = np.array([0,0,0]).astype(np.float64)
+		for i in np.arange(frame+1):
+			translation_vector += difference_vector_dic[i]
+
+		translation_vector += default_vector
+
+		translated_ref_image_data = translate_3D(ref_image_data,translation_vector)
+		XY_max_translated_ref_image_data = np.max(translated_ref_image_data,axis = 0)
+		YZ_max_translated_ref_image_data = np.max(translated_ref_image_data,axis = 2)
+		imwrite(os.path.join(translated_max_folder,'XY_max_translated_'+str(1000+frame)+'.tif'), XY_max_translated_ref_image_data.astype(np.float32), imagej=True, metadata={'axes': 'YX'})
+		imwrite(os.path.join(translated_max_folder,'YZ_max_translated_'+str(1000+frame)+'.tif'), YZ_max_translated_ref_image_data.astype(np.float32), imagej=True, metadata={'axes': 'YX'})
+
+
 		mhd_path = os.path.join(temporary_mhd_folder,stack_tif_name.name.replace('.tif','.mhd'))
 		itk_image = sitk.GetImageFromArray(translated_ref_image_data)
 		itk_image.SetSpacing([x_res,y_res,z_res])
 		sitk.WriteImage(itk_image, mhd_path)
 
 		#translate other channels,save as mhd
-		for channel in other_channels:
-			image_data = io.imread(os.path.join(p,stack_tif_name.name.replace(ref_channel,channel)),plugin = 'tifffile')
-			_,ydim,xdim = image_data.shape
-			back_ground = np.mean(image_data[:,ydim-30:ydim,0:30])
-			image_data = image_data-int(back_ground)+1000
-			translated_image_data = translate_3D(image_data,difference_vector)
-			mhd_path = os.path.join(temporary_mhd_folder,stack_tif_name.name.replace(ref_channel,channel).replace('.tif','.mhd'))
-			itk_image = sitk.GetImageFromArray(translated_image_data)
-			itk_image.SetSpacing([x_res,y_res,z_res])
-			sitk.WriteImage(itk_image, mhd_path)
+		for channel in all_channels:
+			if channel != ref_channel:
+				image_data = io.imread(os.path.join(p,stack_tif_name.name.replace(ref_channel,channel)),plugin = 'tifffile')
+				_,ydim,xdim = image_data.shape
+				back_ground = np.mean(image_data[:,ydim-30:ydim,0:30])
+				image_data = image_data-int(back_ground)+1000
+				translated_image_data = translate_3D(image_data,translation_vector)
+				mhd_path = os.path.join(temporary_mhd_folder,stack_tif_name.name.replace(ref_channel,channel).replace('.tif','.mhd'))
+				itk_image = sitk.GetImageFromArray(translated_image_data)
+				itk_image.SetSpacing([x_res,y_res,z_res])
+				sitk.WriteImage(itk_image, mhd_path)
 
 		#process the reference channel to facilitate registration
 		gauss_ref_image_data = gaussian_filter(io.imread(stack_tif_name,plugin = 'tifffile').astype(np.float32),sigma = 3)
-		translated_gauss_ref_image_data = translate_3D(gauss_ref_image_data,difference_vector)
+		translated_gauss_ref_image_data = translate_3D(gauss_ref_image_data,translation_vector)
 		bgr_gauss_translated_ref_image_data = translated_gauss_ref_image_data - threshold
 		bgr_gauss_translated_ref_image_data[bgr_gauss_translated_ref_image_data<0] = 0
 		#save as mhd
@@ -375,20 +427,33 @@ for sample in ['E4']:
 			break
 
 	#Transform the original mhds based on transformation parameters obtained
-	channels = other_channels
-	channels.append(ref_channel)
 
-	for channel in channels:
-			channel_mhd_names = list( Path(temporary_mhd_folder).glob('*'+channel+'*.mhd') )
-			channel_mhd_names = [i for i in channel_mhd_names if 'reference' not in i.name]
-			channel_mhd_names.sort()
+	for channel in all_channels:
+		channel_mhd_names = list( Path(temporary_mhd_folder).glob('*'+channel+'*.mhd') )
+		channel_mhd_names = [i for i in channel_mhd_names if 'reference' not in i.name]
+		channel_mhd_names.sort()
 
-			print('transforming ' + channel)
-			for frame in tqdm(np.arange(len(channel_mhd_names))):
-				transformation_file = os.path.join(reference_registration_folder,'TransformParameters_' + base_name + "%03d" % (frame) + '.txt')
-				if os.path.isfile(transformation_file):
-					output = cmd([transformix_binary_file, '-in', str(channel_mhd_names[frame]), '-out', output_folder, '-tp',  transformation_file ])
-					os.rename(os.path.join(output_folder,'result.h5'),os.path.join(output_folder,'transformed_' + base_name.replace(ref_channel,channel) + "%03d" % (frame) + '.h5'))
+		print('transforming ' + channel)
+		for frame in tqdm(np.arange(len(channel_mhd_names))):
+			transformation_file = os.path.join(reference_registration_folder,'TransformParameters_' + base_name + "%03d" % (frame) + '.txt')
+			if os.path.isfile(transformation_file):
+				output = cmd([transformix_binary_file, '-in', str(channel_mhd_names[frame]), '-out', output_folder, '-tp',  transformation_file ])
+				os.rename(os.path.join(output_folder,'result.h5'),os.path.join(output_folder,'transformed_' + base_name.replace(ref_channel,channel) + "%03d" % (frame) + '.h5'))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
